@@ -5,9 +5,11 @@ import org.apache.maven.plugin.logging.Log;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 public class TranslationProcessor
 {
@@ -31,12 +33,10 @@ public class TranslationProcessor
         this.removeUnused = removeUnused;
         this.log = log;
 
+        String commonRegex = Pattern.quote(pluginId) + ":([\\w\\-.]+[\\w\\-](?<!\\.png))\"";
 
-        var regex = "\"(" + Pattern.quote(pluginId) + ":" + "[a-zA-Z0-9_\\-.]+)\"";
-        this.javaKeyUsagePattern = Pattern.compile(regex);
-
-        regex = "\"%(" + Pattern.quote(pluginId) + ":" + "[a-zA-Z0-9_\\-.]+)\"";
-        this.fxmlKeyUsagePattern = Pattern.compile(regex);
+        this.javaKeyUsagePattern = Pattern.compile("\"" + commonRegex);
+        this.fxmlKeyUsagePattern = Pattern.compile("\"%" + commonRegex);
     }
 
     public void run() throws IOException
@@ -44,50 +44,84 @@ public class TranslationProcessor
         Set<String> usedKeys = collectUsedKeys();
         log.info("Detected " + usedKeys.size() + " used keys in source code.");
 
-        Files.walk(resDir.toPath())
-                .filter(p -> p.toString().endsWith(".properties") && p.getFileName().toString().startsWith("lang"))
-                .forEach(p -> processPropertiesFile(p.toFile(), usedKeys));
+        // Sort and process duplicate keys
+        try (Stream<Path> paths = Files.walk(resDir.toPath()))
+        {
+            paths.filter(p -> p.toString().endsWith(".properties") && p.getFileName().toString().startsWith("lang"))
+                    .forEach(p -> processPropertiesFile(p.toFile(), usedKeys));
+        }
+
+        // Check missing keys between used keys and properties files
+        try (Stream<Path> paths = Files.walk(resDir.toPath()))
+        {
+            paths.filter(p -> p.toString().endsWith(".properties") && p.getFileName().toString().startsWith("lang"))
+                    .forEach(p ->
+                    {
+                        try
+                        {
+                            Properties props = new Properties();
+                            try (InputStream is = new FileInputStream(p.toFile()))
+                            {
+                                props.load(new InputStreamReader(is));
+                            }
+
+                            for (String key : usedKeys)
+                            {
+                                if (!props.containsKey(key))
+                                {
+                                    log.warn("Missing key in " + p.getFileName() + ": " + key);
+                                }
+                            }
+                        }
+                        catch (IOException e)
+                        {
+                            log.error("Failed to read properties file: " + p, e);
+                        }
+                    });
+        }
+
     }
 
     private Set<String> collectUsedKeys() throws IOException
     {
         Set<String> keys = new HashSet<>();
-        Files.walk(javaDir.toPath())
-                .filter(p -> p.toString().endsWith(".java"))
-                .forEach(p ->
+        try (Stream<Path> javaFiles = Files.walk(javaDir.toPath()).filter(p -> p.toString().endsWith(".java"));
+             Stream<Path> fxmlFiles = Files.walk(resDir.toPath()).filter(p -> p.toString().endsWith(".fxml")))
+        {
+            javaFiles.forEach(p ->
+            {
+                try
                 {
-                    try
+                    String content = Files.readString(p, StandardCharsets.UTF_8);
+                    Matcher matcher = javaKeyUsagePattern.matcher(content);
+                    while (matcher.find())
                     {
-                        String content = Files.readString(p, StandardCharsets.UTF_8);
-                        Matcher matcher = javaKeyUsagePattern.matcher(content);
-                        while (matcher.find())
-                        {
-                            keys.add(matcher.group(1));
-                        }
+                        keys.add(matcher.group(1));
                     }
-                    catch (Exception e)
-                    {
-                        log.warn("Could not read " + p + ": " + e.getMessage());
-                    }
-                });
-        Files.walk(resDir.toPath())
-                .filter(p -> p.toString().endsWith(".fxml"))
-                .forEach(p ->
+                }
+                catch (Exception e)
                 {
-                    try
+                    log.warn("Could not read java file " + p + ": " + e.getMessage());
+                }
+            });
+            fxmlFiles.forEach(p ->
+            {
+                try
+                {
+                    String content = Files.readString(p, StandardCharsets.UTF_8);
+                    Matcher matcher = fxmlKeyUsagePattern.matcher(content);
+                    while (matcher.find())
                     {
-                        String content = Files.readString(p, StandardCharsets.UTF_8);
-                        Matcher matcher = fxmlKeyUsagePattern.matcher(content);
-                        while (matcher.find())
-                        {
-                            keys.add(matcher.group(1));
-                        }
+                        keys.add(matcher.group(1));
                     }
-                    catch (Exception e)
-                    {
-                        log.warn("Could not read " + p + ": " + e.getMessage());
-                    }
-                });
+                }
+                catch (Exception e)
+                {
+                    log.warn("Could not read fxml file " + p + ": " + e.getMessage());
+                }
+            });
+        }
+
         return keys;
     }
 
@@ -123,8 +157,8 @@ public class TranslationProcessor
             while (iterator.hasNext())
             {
                 Map.Entry<String, String> entry = iterator.next();
-                
-                if (!usedKeys.contains(pluginId + ":" + entry.getKey()))
+
+                if (!usedKeys.contains(entry.getKey()))
                 {
                     unusedEntries.put(entry.getKey(), entry.getValue());
                     iterator.remove();
@@ -138,7 +172,7 @@ public class TranslationProcessor
                     writer.write(entry.getKey() + "=" + entry.getValue().replace("\n", "\\n") + "\n");
                 }
 
-                if (!removeUnused)
+                if (!removeUnused && !unusedEntries.isEmpty())
                 {
                     writer.write("\n### Unused keys: ###\n");
 
